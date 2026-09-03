@@ -1,0 +1,263 @@
+name: Release
+
+run-name: Release ${{ github.event.release.tag_name || inputs.release_tag }}
+
+# Triggered automatically when a GitHub Release is created.
+# workflow_dispatch is provided for testing without creating a real release.
+#
+# The release's pre-release flag declares the intent; the tag format must
+# agree with it or the workflow fails:
+#   pre-release  → tag X.Y.Z-RC → deploy to staging (image sourced from dev)
+#   full release → tag X.Y.Z    → deploy to prod    (image sourced from staging)
+#   v prefix is accepted: v1.2.3, v1.2.3-RC
+#   Any other format, or a flag/format mismatch, fails the workflow immediately.
+# Manual runs (workflow_dispatch) have no pre-release flag, so the target is
+# derived from the tag format alone.
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: >
+          Release tag — X.Y.Z for prod or X.Y.Z-RC for staging (v prefix optional).
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  issues: write
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # 1. Validate the release tag and decide the target environment.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.parse.outputs.release_tag }}
+      target_env:  ${{ steps.parse.outputs.target_env }}
+      source_env:  ${{ steps.parse.outputs.source_env }}
+
+    steps:
+      - name: Parse and validate release tag
+        id: parse
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.release_tag }}"
+            # Manual runs have no pre-release flag: derive intent from the tag.
+            PRERELEASE=""
+          else
+            TAG="${{ github.event.release.tag_name }}"
+            PRERELEASE="${{ github.event.release.prerelease }}"
+          fi
+          echo "Release tag: ${TAG}"
+
+          # Strip optional v prefix before semver validation
+          CLEAN="${TAG#v}"
+
+          IS_RC=false
+          IS_GA=false
+          [[ "${CLEAN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-RC$ ]] && IS_RC=true
+          [[ "${CLEAN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && IS_GA=true
+
+          if ! ${IS_RC} && ! ${IS_GA}; then
+            echo "::error::Invalid release tag '${TAG}'." \
+              "Expected X.Y.Z (full release) or X.Y.Z-RC (pre-release), with optional v prefix."
+            exit 1
+          fi
+
+          # On release events the pre-release flag declares the intent and the
+          # tag format must agree with it — never route on the tag alone.
+          if [ "${PRERELEASE}" = "true" ] && ! ${IS_RC}; then
+            echo "::error::Release is marked as pre-release but tagged '${TAG}'." \
+              "Pre-releases must be tagged X.Y.Z-RC."
+            exit 1
+          fi
+          if [ "${PRERELEASE}" = "false" ] && ! ${IS_GA}; then
+            echo "::error::Release is marked as a full release but tagged '${TAG}'." \
+              "Full releases must be tagged X.Y.Z without suffix —" \
+              "mark the release as a pre-release if an RC was intended."
+            exit 1
+          fi
+
+          if ${IS_RC}; then
+            TARGET_ENV="staging"
+            SOURCE_ENV="dev"
+            echo "Release candidate → target: staging (image sourced from dev)"
+          else
+            TARGET_ENV="prod"
+            SOURCE_ENV="staging"
+            echo "GA release → target: prod (image sourced from staging)"
+          fi
+
+          {
+            echo "release_tag=${TAG}"
+            echo "target_env=${TARGET_ENV}"
+            echo "source_env=${SOURCE_ENV}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2. Query the source environment to find the sha-* image tag currently
+  #    running.  Source env is dev for RC releases, staging for GA.  The job
+  #    binds the matching GitHub Environment, resolves that environment's
+  #    cloud from DEPLOY_TARGET_CLOUD (same rule as the deploy.yml router),
+  #    and runs the read-only query for that cloud.  Each cloud read exports
+  #    IMAGE_REF; a final cloud-agnostic step parses and validates it.
+  # ---------------------------------------------------------------------------
+  identify-image:
+    name: Identify image deployed to ${{ needs.validate.outputs.source_env }}
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ needs.validate.outputs.source_env }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_base: ${{ steps.image.outputs.image_base }}
+      sha_tag:    ${{ steps.image.outputs.sha_tag }}
+
+    steps:
+      - name: Resolve source environment cloud
+        id: cloud
+        run: |
+          CLOUD="${{ vars.DEPLOY_TARGET_CLOUD }}"
+          case "${CLOUD}" in
+            azure|aws|gcp)
+              echo "Source environment '${{ needs.validate.outputs.source_env }}' targets: ${CLOUD}"
+              echo "cloud=${CLOUD}" >> "$GITHUB_OUTPUT"
+              ;;
+            '')
+              echo "::error::DEPLOY_TARGET_CLOUD is not set for environment" \
+                "'${{ needs.validate.outputs.source_env }}'. Configure it as a" \
+                "GitHub Environment variable (or a repository-level default)" \
+                "with one of: azure | aws | gcp."
+              exit 1
+              ;;
+            *)
+              echo "::error::Invalid DEPLOY_TARGET_CLOUD value '${CLOUD}' for" \
+                "environment '${{ needs.validate.outputs.source_env }}'." \
+                "Allowed values: azure | aws | gcp."
+              exit 1
+              ;;
+          esac
+
+      - name: Azure login (OIDC)
+        if: steps.cloud.outputs.cloud == 'azure'
+        uses: azure/login@v3
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Read current image from Azure Web App
+        if: steps.cloud.outputs.cloud == 'azure'
+        run: |
+          RAW=$(az webapp config show \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name            "${{ vars.AZURE_WEBAPP_NAME }}" \
+            --query linuxFxVersion -o tsv)
+
+          echo "Raw linuxFxVersion: ${RAW}"
+
+          # Strip DOCKER| prefix emitted by App Service
+          echo "IMAGE_REF=${RAW#DOCKER|}" >> "$GITHUB_ENV"
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.cloud.outputs.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Read current image from ECS service
+        if: steps.cloud.outputs.cloud == 'aws'
+        run: |
+          TASKDEF=$(aws ecs describe-services \
+            --cluster  "${{ vars.AWS_ECS_CLUSTER }}" \
+            --services "${{ vars.AWS_ECS_SERVICE }}" \
+            --query 'services[0].taskDefinition' --output text)
+
+          IMG=$(aws ecs describe-task-definition \
+            --task-definition "${TASKDEF}" \
+            --query 'taskDefinition.containerDefinitions[0].image' --output text)
+
+          echo "Task definition: ${TASKDEF}"
+          echo "IMAGE_REF=${IMG}" >> "$GITHUB_ENV"
+
+      - name: Read current image from GCP (not implemented)
+        if: steps.cloud.outputs.cloud == 'gcp'
+        run: |
+          echo "::error::GCP image identification is not implemented yet —" \
+            "tracked in issue H10 (deors/template-helloworld-express#10)."
+          exit 1
+
+      - name: Parse and validate image reference
+        id: image
+        run: |
+          FULL="${IMAGE_REF}"
+          IMAGE_BASE="${FULL%:*}"
+          SHA_TAG="${FULL##*:}"
+
+          if [[ "${IMAGE_BASE}" != ghcr.io/* ]]; then
+            echo "::error::${{ needs.validate.outputs.source_env }} is not running a GHCR image (got: ${IMAGE_BASE})." \
+              "Ensure the source environment was deployed successfully before creating a release."
+            exit 1
+          fi
+
+          echo "Image base : ${IMAGE_BASE}"
+          echo "SHA tag    : ${SHA_TAG}"
+
+          {
+            echo "image_base=${IMAGE_BASE}"
+            echo "sha_tag=${SHA_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 3. Add the release tag to the image already in GHCR.
+  #    No layers are changed — this is a manifest retag only.
+  #    After this step the same image digest carries both tags:
+  #      sha-<short>   → traceability back to the commit
+  #      X.Y.Z[-RC]    → release identity
+  # ---------------------------------------------------------------------------
+  retag-image:
+    name: Retag image with release version
+    needs: [validate, identify-image]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Pull, retag and push
+        run: |
+          SRC="${{ needs.identify-image.outputs.image_base }}:${{ needs.identify-image.outputs.sha_tag }}"
+          DST="${{ needs.identify-image.outputs.image_base }}:${{ needs.validate.outputs.release_tag }}"
+
+          echo "Source : ${SRC}"
+          echo "New tag: ${DST}"
+
+          docker pull "${SRC}"
+          docker tag  "${SRC}" "${DST}"
+          docker push "${DST}"
+
+          echo "Pushed: ${DST}"
+
+  # ---------------------------------------------------------------------------
+  # 4. Deploy the release-tagged image to the target environment.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy ${{ needs.validate.outputs.release_tag }} to ${{ needs.validate.outputs.target_env }}
+    needs: [validate, retag-image]
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: ${{ needs.validate.outputs.target_env }}
+      image_tag:   ${{ needs.validate.outputs.release_tag }}
+    secrets: inherit

@@ -1,0 +1,239 @@
+name: Deploy
+
+# Cloud-agnostic deploy router. Resolves the target cloud and delegates the
+# deployment to the matching cloud-specific reusable workflow. This file must
+# not contain any cloud-provider deployment commands.
+#
+# Cloud resolution: the DEPLOY_TARGET_CLOUD variable, read in the scope of the
+# target GitHub Environment. It is expected to be configured per environment
+# by the orchestrator, alongside the other cloud parameters (accounts,
+# subscriptions, principals, etc.). An environment-level value overrides a
+# repository-level one, so each environment can target a different cloud
+# (e.g. dev on azure, staging on aws, prod on gcp), while a repository-level
+# value acts as the default for environments that don't override it.
+#
+# Note: `uses:` references to reusable workflows are resolved when the run
+# starts, even for jobs skipped by their `if:` condition — so the three
+# cloud workflow files must always exist.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Target environment (dev | staging | prod)
+        type: string
+        required: true
+      image_tag:
+        description: Container image tag to deploy (e.g. sha-abc1234)
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, staging, prod]
+        required: true
+      image_tag:
+        description: Container image tag to deploy (e.g. sha-abc1234)
+        type: string
+        required: true
+
+jobs:
+
+  resolve-cloud:
+    name: Resolve target cloud
+    runs-on: ubuntu-latest
+    # Bind to the target environment so vars.DEPLOY_TARGET_CLOUD resolves the
+    # environment-scoped value (falling back to the repository-level one).
+    environment: ${{ inputs.environment }}
+    outputs:
+      cloud: ${{ steps.resolve.outputs.cloud }}
+
+    steps:
+      - name: Resolve and validate target cloud
+        id: resolve
+        run: |
+          CLOUD="${{ vars.DEPLOY_TARGET_CLOUD }}"
+
+          if [ -z "${CLOUD}" ]; then
+            echo "::error::DEPLOY_TARGET_CLOUD is not set for environment" \
+              "'${{ inputs.environment }}'. Configure it as an environment" \
+              "variable (or a repository-level default) with one of:" \
+              "azure | aws | gcp."
+            exit 1
+          fi
+
+          case "${CLOUD}" in
+            azure|aws|gcp)
+              echo "Target cloud for '${{ inputs.environment }}': ${CLOUD}"
+              echo "cloud=${CLOUD}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Invalid DEPLOY_TARGET_CLOUD value '${CLOUD}' for" \
+                "environment '${{ inputs.environment }}'. Allowed values:" \
+                "azure | aws | gcp."
+              exit 1
+              ;;
+          esac
+
+  open-report:
+    # Start half of the deployment audit record, mirroring report-result's
+    # structure — one job, two steps: the run-summary segment is written for
+    # every environment; the report issue is opened for staging/prod only
+    # (dev deploys are part of the fail-early CI loop and keep no issue
+    # trail). Runs in parallel with the deploy jobs so reporting never
+    # blocks a deployment.
+    name: Open deployment report
+    needs: resolve-cloud
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    outputs:
+      issue_number: ${{ steps.open.outputs.number }}
+
+    steps:
+      - name: Write deployment start summary
+        # Builds the canonical start record (started.md) and appends it to the
+        # run summary; the issue step reuses the same file so both reporting
+        # mechanisms carry the same table and facts.
+        run: |
+          cat > started.md <<EOF
+          ## 🚀 Deployment started: ${{ inputs.image_tag }} → ${{ inputs.environment }} (${{ needs.resolve-cloud.outputs.cloud }})
+
+          | | |
+          | --- | --- |
+          | Environment | \`${{ inputs.environment }}\` |
+          | Target cloud | \`${{ needs.resolve-cloud.outputs.cloud }}\` |
+          | Image tag | \`${{ inputs.image_tag }}\` |
+          | Trigger | \`${{ github.event_name }}\` via workflow \`${{ github.workflow }}\` |
+          | Initiated by | @${{ github.actor }} |
+          | Commit | ${{ github.sha }} |
+          | Started at | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |
+          | Workflow run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+          EOF
+
+          cat started.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open deployment report issue
+        id: open
+        if: inputs.environment != 'dev'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp started.md body.md
+          cat >> body.md <<'EOF'
+
+          The result will be posted as a comment when the deployment finishes.
+          This issue stays open until a project member reviews the results and
+          closes it to acknowledge the deployment.
+          EOF
+
+          URL=$(gh issue create \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Deployment: ${{ inputs.image_tag }} → ${{ inputs.environment }} (${{ needs.resolve-cloud.outputs.cloud }})" \
+            --body-file body.md)
+          echo "Opened ${URL}"
+          echo "number=${URL##*/}" >> "$GITHUB_OUTPUT"
+
+  deploy-azure:
+    name: Deploy on Azure
+    needs: resolve-cloud
+    if: needs.resolve-cloud.outputs.cloud == 'azure'
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/deploy-azure.yml
+    with:
+      environment: ${{ inputs.environment }}
+      image_tag: ${{ inputs.image_tag }}
+    secrets: inherit
+
+  deploy-aws:
+    name: Deploy on AWS
+    needs: resolve-cloud
+    if: needs.resolve-cloud.outputs.cloud == 'aws'
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/deploy-aws.yml
+    with:
+      environment: ${{ inputs.environment }}
+      image_tag: ${{ inputs.image_tag }}
+    secrets: inherit
+
+  deploy-gcp:
+    name: Deploy on GCP
+    needs: resolve-cloud
+    if: needs.resolve-cloud.outputs.cloud == 'gcp'
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/deploy-gcp.yml
+    with:
+      environment: ${{ inputs.environment }}
+      image_tag: ${{ inputs.image_tag }}
+    secrets: inherit
+
+  report-result:
+    name: Report deployment result
+    needs: [resolve-cloud, open-report, deploy-azure, deploy-aws, deploy-gcp]
+    if: always() && needs.resolve-cloud.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Write deployment summary
+        run: |
+          case "${{ needs.resolve-cloud.outputs.cloud }}" in
+            azure) OUTCOME="${{ needs.deploy-azure.result }}" ;;
+            aws)   OUTCOME="${{ needs.deploy-aws.result }}" ;;
+            gcp)   OUTCOME="${{ needs.deploy-gcp.result }}" ;;
+          esac
+
+          ICON="❌"
+          [ "${OUTCOME}" = "success" ] && ICON="✅"
+
+          {
+            echo "OUTCOME=${OUTCOME}"
+            echo "ICON=${ICON}"
+          } >> "$GITHUB_ENV"
+
+          # Builds the canonical result record (finished.md) and appends it to
+          # the run summary; the issue step reuses the same file so both
+          # reporting mechanisms carry the same table and facts. The start
+          # segment already carries the who/what/how/when evidence.
+          cat > finished.md <<EOF
+          ## ${ICON} Deployment finished: ${{ inputs.image_tag }} → ${{ inputs.environment }} (${{ needs.resolve-cloud.outputs.cloud }})
+
+          | | |
+          | --- | --- |
+          | Outcome | **${OUTCOME}** |
+          | Azure job | ${{ needs.deploy-azure.result }} |
+          | AWS job | ${{ needs.deploy-aws.result }} |
+          | GCP job | ${{ needs.deploy-gcp.result }} |
+          | Finished at | $(date -u +'%Y-%m-%dT%H:%M:%SZ') |
+          | Evidence | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+          EOF
+
+          cat finished.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment result on the report issue
+        # Only staging/prod deployments have a report issue (the open step
+        # is skipped for dev, leaving the issue_number output empty). The
+        # issue is deliberately never closed by automation: a project member
+        # reviews the results and evidence and closes it to acknowledge —
+        # whatever the outcome.
+        if: needs.open-report.result == 'success' && needs.open-report.outputs.issue_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ needs.open-report.outputs.issue_number }}
+        run: |
+          cp finished.md comment.md
+          cat >> comment.md <<'EOF'
+
+          Review the results and the linked evidence, then close this issue to acknowledge the deployment.
+          EOF
+
+          gh issue comment "${ISSUE}" --repo "${GITHUB_REPOSITORY}" --body-file comment.md

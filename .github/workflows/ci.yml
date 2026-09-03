@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  issues: write
+
+jobs:
+  build-test-push:
+    name: Build, Test & Push
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_full: ${{ steps.meta.outputs.image_full }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TAG="sha-${SHORT_SHA}"
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/${REPO}"
+          {
+            echo "image_tag=${TAG}"
+            echo "image_full=${IMAGE}:${TAG}"
+            echo "image_base=${IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build container image
+        run: |
+          docker build \
+            --tag "${{ steps.meta.outputs.image_full }}" \
+            --tag "${{ steps.meta.outputs.image_base }}:latest" \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            .
+
+      - name: Push container image
+        # The package visibility is automatically inherited from the repository:
+        # a public repository produces a public package, a private repository
+        # produces a private package.
+        # App Service (which has no registry credentials) can pull the image as
+        # long as the repository — and therefore the package — is public.
+        run: |
+          docker push "${{ steps.meta.outputs.image_full }}"
+          docker push "${{ steps.meta.outputs.image_base }}:latest"
+
+  deploy-dev:
+    name: Deploy to dev
+    needs: build-test-push
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: dev
+      image_tag: ${{ needs.build-test-push.outputs.image_tag }}
+    # Inherit repo-level secrets so the called workflow can use GITHUB_TOKEN for OIDC.
+    secrets: inherit
